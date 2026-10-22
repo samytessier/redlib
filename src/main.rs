@@ -422,8 +422,12 @@ async fn main() {
 		})
 	});
 
-	// Default service in case no routes match
-	app.at("/*").get(|req| error(req, "Nothing here").boxed());
+	// Token-gated JSON API, see src/api.rs
+	app.at("/api/v1/health").get(|r| redlib::api::health(r).boxed());
+	app.at("/api/v1/raw/*path").get(|r| redlib::api::raw(r).boxed());
+
+	// Default service in case no routes match (a JSON 404 under /api/)
+	app.at("/*").get(|req| redlib::api::fallback(req).boxed());
 
 	println!("Running Redlib v{} on {listener}!", env!("CARGO_PKG_VERSION"));
 
