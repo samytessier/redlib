@@ -90,7 +90,12 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				comments,
 				post,
 				url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
-				sort,
+				// Without a chosen sort, the post's suggested one
+				sort: if sort.is_empty() {
+					response[1]["data"]["sort"].as_str().unwrap_or_default().to_string()
+				} else {
+					sort
+				},
 				prefs: Preferences::new(&req),
 				single_thread,
 				url: req_url,

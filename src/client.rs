@@ -1,7 +1,7 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
-use crate::utils::{format_url, param, Post};
+use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
 use cached::proc_macro::cached;
 use futures_lite::future::block_on;
@@ -12,7 +12,7 @@ use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 use std::result::Result;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::LazyLock;
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
@@ -46,9 +46,14 @@ pub fn burn_rate_limit_unit() {
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 
-/// Unix time until which the `/comments/` JSON API is assumed blocked, see `shreddit.rs`.
-static COMMENTS_API_BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
-const COMMENTS_API_RETRY_SECS: u64 = 3600;
+/// Rolls over the OAuth token in the background when its rate limit runs low.
+pub fn roll_over_if_low() {
+	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
+	if current_rate_limit < 10 && !OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst) {
+		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
+		tokio::spawn(force_refresh_token());
+	}
+}
 
 const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
@@ -59,7 +64,7 @@ pub fn build_client() -> WreqClient {
 	// Keeping this list short to aid in privacy.
 	// The more emulations, the more unique a fingerprint each instance has.
 	// But some emulations should increase evasiveness.
-	// Desktop platforms only: reddit.com serves mobile clients 10 comments per request instead of 25 (see shreddit.rs).
+	// Desktop platforms only, as when the comments scraper (removed) needed them; others are untested.
 	let profiles = [Profile::Chrome149, Profile::Firefox151];
 	let platforms = [Platform::Windows, Platform::MacOS];
 
@@ -238,13 +243,8 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
 fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	// Reddit blocks `/comments/` API paths by their literal text, but decodes an
-	// encoded slash before routing. Rewritten here so redirects get it too.
-	let url = if base_path == REDDIT_URL_BASE {
-		format!("{base_path}{}", path.replacen("/comments/", "/comments%2F", 1))
-	} else {
-		format!("{base_path}{path}")
-	};
+	// Build Reddit URL from path.
+	let url = format!("{base_path}{path}");
 
 	let mut headers: Vec<(String, String)> = vec![
 		("Host".into(), host.into()),
@@ -340,35 +340,25 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	// While the comments API is blocked, skip straight to scraping instead of wasting a request.
-	// Cursors come from scraped pages' "More comments" links, which only the scraper understands.
-	let is_comments = path.contains("/comments/");
-	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-	if is_comments && (param(&path, "cursor").is_some() || now < COMMENTS_API_BLOCKED_UNTIL.load(Ordering::Relaxed)) {
-		return Box::pin(crate::shreddit::thread(&path, quarantine)).await;
+	// The `/comments/` JSON API is blocked for anonymous tokens; comments come from GraphQL instead
+	if path.contains("/comments/") {
+		return Box::pin(crate::gql::thread(&path, quarantine)).await;
+	}
+	// So are feeds and posts by ID, since 2026-10-28
+	if let Some(result) = Box::pin(crate::gql_feed::route(&path, quarantine)).await {
+		return result;
 	}
 
 	// First, handle rolling over the OAUTH_CLIENT if need be.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
-	if current_rate_limit < 10 && !is_rolling_over {
-		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
-		tokio::spawn(force_refresh_token());
-	}
+	roll_over_if_low();
 	burn_rate_limit_unit();
 
 	// Fetch the url...
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
-
-			// Reddit's network security block is an HTML page; private/quarantined subs are JSON 403s
-			let is_html = response.headers().get(wreq_header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
-			if is_comments && status == 403 && is_html {
-				warn!("Comments API blocked, scraping comments for the next {COMMENTS_API_RETRY_SECS}s");
-				COMMENTS_API_BLOCKED_UNTIL.store(now + COMMENTS_API_RETRY_SECS, Ordering::Relaxed);
-				return Box::pin(crate::shreddit::thread(&path, quarantine)).await;
-			}
 
 			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
 				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
@@ -485,11 +475,12 @@ pub async fn rate_limit_check() -> Result<(), String> {
 		return Ok(());
 	}
 
-	// First, check a subreddit.
+	// First, check a subreddit. That's one GraphQL request, which has a rate
+	// limit of 600 per token.
 	self_check("reddit").await?;
-	// This will reduce the rate limit to 99. Assert this check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 1 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
+	// This will reduce the rate limit to 599. Assert this check.
+	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 599 {
+		return Err(format!("Rate limit check 1 failed: expected 599, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
 	}
 	// Now, we switch out the OAuth client.
 	// This checks for the IP rate limit association.
@@ -497,8 +488,8 @@ pub async fn rate_limit_check() -> Result<(), String> {
 	// Now, check a new sub to break cache.
 	self_check("rust").await?;
 	// Again, assert the rate limit check.
-	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 99 {
-		return Err(format!("Rate limit check 2 failed: expected 99, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
+	if OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst) != 599 {
+		return Err(format!("Rate limit check 2 failed: expected 599, got {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst)));
 	}
 
 	Ok(())
@@ -538,8 +529,6 @@ mod tests {
 	use super::*;
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
-	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
-
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_rate_limit_check() {
 		rate_limit_check().await.unwrap();
@@ -555,12 +544,6 @@ mod tests {
 			// check rate limit
 			rate_limit_check().await.unwrap();
 		});
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	async fn test_localization_popular() {
-		let val = json(POPULAR_URL.to_string(), false).await.unwrap();
-		assert_eq!("GLOBAL", val["data"]["geo_filter"].as_str().unwrap());
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

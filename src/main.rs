@@ -263,6 +263,10 @@ async fn main() {
 
 	// Proxy media through Redlib
 	app.at("/vid/:id/:prefix/:size").get(|r| proxy(r, "https://v.redd.it/{id}/{prefix}_{size}").boxed());
+	app.at("/packaged/*path").get(|r| proxy(r, "https://packaged-media.redd.it/{path}").boxed());
+	app
+		.at("/packaged-external/*path")
+		.get(|r| proxy(r, "https://external-packaged-media.redd.it/{path}").boxed());
 	app.at("/hls/:id/*path").get(|r| proxy(r, "https://v.redd.it/{id}/{path}").boxed());
 	app.at("/img/*path").get(|r| proxy(r, "https://i.redd.it/{path}").boxed());
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());
